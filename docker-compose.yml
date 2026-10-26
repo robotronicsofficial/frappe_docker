@@ -59,6 +59,7 @@ services:
 
   frontend:
     <<: [*erpnext]
+    networks: [erp, dokploy-network]
     command: [nginx-entrypoint.sh]
     depends_on: [backend, websocket]
     environment:
@@ -127,3 +128,5 @@ volumes:
 
 networks:
   erp:
+  dokploy-network:
+    external: true
