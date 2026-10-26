@@ -1,0 +1,129 @@
+x-erpnext: &erpnext
+  image: frappe/erpnext:v16.52.1   # pin; bump deliberately after reading release notes
+  networks: [erp]
+  restart: unless-stopped
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
+    - logs:/home/frappe/frappe-bench/logs
+
+x-wait-config: &wait_config
+  depends_on:
+    configurator:
+      condition: service_completed_successfully
+
+services:
+  configurator:
+    <<: *erpnext
+    restart: "no"
+    entrypoint: [bash, -c]
+    command:
+      - >
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host db;
+        bench set-config -gp db_port 3306;
+        bench set-config -g redis_cache "redis://redis-cache:6379";
+        bench set-config -g redis_queue "redis://redis-queue:6379";
+        bench set-config -g redis_socketio "redis://redis-queue:6379";
+        bench set-config -gp socketio_port 9000;
+        bench set-config -g chromium_path /usr/lib/chromium/chromium-headless-shell;
+
+  create-site:
+    <<: *erpnext
+    restart: "no"
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+    entrypoint: [bash, -c]
+    command:
+      - >
+        wait-for-it -t 120 db:3306;
+        wait-for-it -t 120 redis-cache:6379;
+        wait-for-it -t 120 redis-queue:6379;
+        if [ -d "sites/$${SITE_NAME}" ]; then
+          echo "site exists, skipping";
+        else
+          bench new-site --mariadb-user-host-login-scope='%' --admin-password="$${ADMIN_PASSWORD}" --db-root-username=root --db-root-password="$${DB_ROOT_PASSWORD}" --install-app erpnext --set-default "$${SITE_NAME}";
+        fi;
+    environment:
+      SITE_NAME: ${SITE_NAME}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      DB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+
+  backend:
+    <<: [*erpnext, *wait_config]
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+
+  frontend:
+    <<: [*erpnext]
+    command: [nginx-entrypoint.sh]
+    depends_on: [backend, websocket]
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      FRAPPE_SITE_NAME_HEADER: ${SITE_NAME}
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: 120
+      CLIENT_MAX_BODY_SIZE: 50m
+    expose: ["8080"]
+
+  websocket:
+    <<: [*erpnext, *wait_config]
+    command: [node, /home/frappe/frappe-bench/apps/frappe/socketio.js]
+
+  scheduler:
+    <<: [*erpnext, *wait_config]
+    command: [bench, schedule]
+
+  queue-short:
+    <<: [*erpnext, *wait_config]
+    command: [bench, worker, --queue, "short,default"]
+
+  queue-long:
+    <<: [*erpnext, *wait_config]
+    command: [bench, worker, --queue, "long,default,short"]
+
+  db:
+    image: mariadb:11.8
+    networks: [erp]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      start_period: 5s
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+    volumes:
+      - db-data:/var/lib/mysql
+
+  redis-cache:
+    image: redis:8.6-alpine
+    networks: [erp]
+    restart: unless-stopped
+
+  redis-queue:
+    image: redis:8.6-alpine
+    networks: [erp]
+    restart: unless-stopped
+    volumes:
+      - redis-queue-data:/data
+
+volumes:
+  sites:
+  logs:
+  db-data:
+  redis-queue-data:
+
+networks:
+  erp:
